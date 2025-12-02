@@ -322,152 +322,197 @@ import os
 import time
 import logging
 import subprocess
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from telegram.ext import Updater, CommandHandler
 from telegram import Update
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# 配置
+# ===== 配置 =====
 TOKEN = "Bot Token"  # 替换为你的Bot Token
-MESSAGE_DIR = "/var/log/asterisk/unread_sms/"  # 替换为你的消息文件夹路径
-ALLOWED_IDS = [123456789]  # 替换为允许的Telegram用户ID列表
+MESSAGE_DIR = "/var/log/asterisk/unread_sms/"
+ALLOWED_IDS = [123456789]
 
-# 代理配置（根据你的代理类型选择一种）
 PROXY = {
-    # HTTP代理示例
-    # 'proxy_url': 'http://proxy.example.com:8080',
-    # 如果需要认证：
-    # 'proxy_url': 'http://username:password@proxy.example.com:8080',
     'proxy_url': 'http://username:password@proxy.example.com:8080'
-    # SOCKS5代理示例
-    #'proxy_url': 'socks5://proxy.example.com:1080',
-    # 如果需要认证：
-    # 'proxy_url': 'socks5://username:password@proxy.example.com:1080',
 }
 
-# 日志配置
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ===== 日志 =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class MessageHandler(FileSystemEventHandler):
-    """文件夹变化处理器"""
+
+# ------------------------------------------------------------
+# 工具函数
+# ------------------------------------------------------------
+def safe_send(bot, chat_ids, text, max_retries=5, retry_delay=2):
+    """
+    安全发送消息，自动重试
+    max_retries: 最大重试次数
+    retry_delay: 每次重试间隔（秒）
+    """
+    for cid in chat_ids:
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                bot.send_message(chat_id=cid, text=text)
+                logger.info(f"已发送消息给用户 {cid}")
+                break  # 成功后不再重试
+
+            except Exception as e:
+                attempt += 1
+                logger.error(f"发送消息给 {cid} 失败（第 {attempt} 次）: {e}")
+
+                if attempt > max_retries:
+                    logger.error(f"消息彻底发送失败，放弃发送: {cid}")
+                    break
+
+                time.sleep(retry_delay)
+
+
+
+def read_file_content(path):
+    """安全读取文件内容"""
+    try:
+        if not os.path.exists(path):
+            return None, "文件不存在"
+
+        size = os.path.getsize(path)
+        if size == 0:
+            return "", "文件为空"
+
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+
+        if not content:
+            return "", "内容为空"
+
+        return content, None
+    except Exception as e:
+        return None, str(e)
+
+
+def safe_delete_file(path):
+    """安全删除文件"""
+    try:
+        os.remove(path)
+        logger.info(f"已删除文件: {path}")
+    except Exception as e:
+        logger.error(f"删除文件失败 {path}: {e}")
+
+
+# ------------------------------------------------------------
+# Watchdog 文件监控
+# ------------------------------------------------------------
+class SMSFileHandler(FileSystemEventHandler):
+    """文件夹监控处理"""
+
     def __init__(self, bot, allowed_ids):
         self.bot = bot
         self.allowed_ids = allowed_ids
 
     def on_created(self, event):
-        """当新文件创建时触发"""
-        if not event.is_directory and event.src_path.endswith('.txt'):
-            logger.info(f"检测到新文件: {event.src_path}")
-            time.sleep(0.5)  # 确保文件写入完成
-            try:
-                if not os.path.exists(event.src_path):
-                    logger.error(f"文件 {event.src_path} 不存在")
-                    return
-                if os.path.getsize(event.src_path) == 0:
-                    logger.warning(f"文件 {event.src_path} 为空")
-                    for chat_id in self.allowed_ids:
-                        self.bot.send_message(chat_id=chat_id, text=f"New message: 文件 {os.path.basename(event.src_path)} 为空")
-                    os.remove(event.src_path)
-                    return
+        if event.is_directory or not event.src_path.endswith('.txt'):
+            return
 
-                with open(event.src_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                logger.info(f"读取到文件内容: {content}")
-                
-                if not content:
-                    logger.warning(f"文件 {event.src_path} 内容为空")
-                    for chat_id in self.allowed_ids:
-                        self.bot.send_message(chat_id=chat_id, text=f"New message: 文件 {os.path.basename(event.src_path)} 内容为空")
-                else:
-                    for chat_id in self.allowed_ids:
-                        self.bot.send_message(chat_id=chat_id, text=f"New message:\n{content}")
-                        logger.info(f"消息已发送给用户 {chat_id}")
-                
-                os.remove(event.src_path)
-                logger.info(f"删除文件: {event.src_path}")
-            except Exception as e:
-                logger.error(f"处理文件 {event.src_path} 失败: {str(e)}")
-                for chat_id in self.allowed_ids:
-                    self.bot.send_message(chat_id=chat_id, text=f"读取 {os.path.basename(event.src_path)} 失败: {str(e)}")
+        filepath = event.src_path
+        logger.info(f"检测到新文件: {filepath}")
 
+        time.sleep(0.5)  # 确保文件写入完成
+
+        content, error = read_file_content(filepath)
+
+        if error:
+            safe_send(self.bot, self.allowed_ids,
+                      f"New message: {os.path.basename(filepath)} - {error}")
+            safe_delete_file(filepath)
+            return
+
+        # 正常内容
+        safe_send(self.bot, self.allowed_ids,
+                  f"New message:\n{content}")
+
+        safe_delete_file(filepath)
+
+
+# ------------------------------------------------------------
+# Telegram Bot 命令
+# ------------------------------------------------------------
 def get_user_id(update: Update, context):
-    """处理 /myid 命令，获取用户ID"""
-    user_id = update.message.from_user.id
-    update.message.reply_text(f"你的Telegram ID是: {user_id}")
-    logger.info(f"用户 {user_id} 查询了其ID")
+    uid = update.message.from_user.id
+    update.message.reply_text(f"你的Telegram ID是: {uid}")
+    logger.info(f"用户 {uid} 查询了 ID")
+
 
 def send_sms(update: Update, context):
-    """处理 /send 命令，执行asterisk发送短信"""
     user_id = update.message.from_user.id
+
     if user_id not in ALLOWED_IDS:
         update.message.reply_text("无权限使用此Bot！")
-        logger.info(f"用户 {user_id} 尝试使用/send，无权限")
+        logger.warning(f"未经授权用户 {user_id} 尝试执行 /send")
         return
 
-    args = context.args
-    if len(args) < 2:
+    if len(context.args) < 2:
         update.message.reply_text("用法: /send <phone_number> <message>")
-        logger.warning(f"用户 {user_id} 输入无效/send命令: {args}")
         return
 
-    phone_number = args[0]
-    message = ' '.join(args[1:])  # 支持多词消息
+    phone_number = context.args[0]
+    message = " ".join(context.args[1:])
 
-    # 验证phone_number（简单检查，确保是数字）
     if not phone_number.isdigit():
         update.message.reply_text("电话号码必须是数字！")
-        logger.warning(f"用户 {user_id} 输入无效电话号码: {phone_number}")
         return
 
-    # 构建asterisk命令
-    command = ['asterisk', '-rx', f'quectel sms quectel0 {phone_number} "{message}"']
-    
+    cmd = ["asterisk", "-rx", f'quectel sms quectel0 {phone_number} "{message}"']
+
     try:
-        # 如果需要sudo，修改为：command = ['sudo', 'asterisk', '-rx', f'quectel sms quectel0 {phone_number} "{message}"']
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         update.message.reply_text(f"短信发送成功: {phone_number}\n输出: {result.stdout}")
-        logger.info(f"用户 {user_id} 发送短信到 {phone_number}: {message}")
+        logger.info(f"短信发送成功 {phone_number}: {message}")
+
     except subprocess.CalledProcessError as e:
-        update.message.reply_text(f"短信发送失败: {str(e)}\n错误: {e.stderr}")
-        logger.error(f"用户 {user_id} 发送短信失败: {str(e)}")
+        update.message.reply_text(f"短信发送失败: {e.stderr}")
+        logger.error(f"短信发送失败: {e}")
     except Exception as e:
         update.message.reply_text(f"执行命令失败: {str(e)}")
-        logger.error(f"用户 {user_id} 执行命令失败: {str(e)}")
+        logger.error(f"执行命令失败: {e}")
 
+
+# ------------------------------------------------------------
+# 文件监控启动
+# ------------------------------------------------------------
 def start_watching(bot, allowed_ids):
-    """启动文件夹监控"""
-    event_handler = MessageHandler(bot, allowed_ids)
+    handler = SMSFileHandler(bot, allowed_ids)
     observer = Observer()
-    observer.schedule(event_handler, MESSAGE_DIR, recursive=False)
+    observer.schedule(handler, MESSAGE_DIR, recursive=False)
     observer.start()
     logger.info("文件夹监控已启动")
 
+
+# ------------------------------------------------------------
+# 主程序
+# ------------------------------------------------------------
 def main():
-    """主函数，启动Bot"""
     updater = Updater(TOKEN, use_context=True, request_kwargs=PROXY)
     dp = updater.dispatcher
 
-    # 添加命令处理器
     dp.add_handler(CommandHandler("myid", get_user_id))
     dp.add_handler(CommandHandler("send", send_sms))
 
-    # 错误处理
-    def error(update, context):
-        logger.error(f"更新 {update} 引发错误: {context.error}")
+    dp.add_error_handler(lambda u, c: logger.error(f"错误: {c.error}"))
 
-    dp.add_error_handler(error)
-
-    # 启动文件夹监控
     start_watching(updater.bot, ALLOWED_IDS)
 
-    # 启动Bot
     updater.start_polling()
     logger.info("Bot已启动")
     updater.idle()
 
+
 if __name__ == '__main__':
-    main() 
+    main()
+
 ```
 
 ### 常驻服务
